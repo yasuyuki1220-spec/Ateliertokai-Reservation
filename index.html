@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Atelier Tokai reservation</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top"><h1>Atelier Tokai reservation</h1></header>
+<main id="app"><p class="note" style="text-align:center;padding:40px 0">読み込み中…</p></main>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script src="firebase-config.js"></script>
+<script src="core.js"></script>
+<script>
+(function(){
+'use strict';
+var app=document.getElementById('app'),C,S={ev:null,slots:[],slot:null,mode:'new',rec:null};
+var esc=function(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})};
+var q=function(id){return document.getElementById(id)};
+var WD='日月火水木金土';
+function day(s){var p=s.split('-'),d=new Date(+p[0],+p[1]-1,+p[2]);return (+p[1])+'月'+(+p[2])+'日（'+WD[d.getDay()]+'）'}
+function rng(s){return s.start==='00:00'&&s.end==='24:00'?'終日':s.start+'〜'+s.end}
+function fmtCode(id){return id.replace(/(.{4})(?=.)/g,'$1-')}
+function dl(ev){return ev.deadlineMs?new Date(ev.deadlineMs).toLocaleString('ja-JP',{month:'long',day:'numeric',hour:'2-digit',minute:'2-digit'}):''}
+function opts(a,b,sel){var o='';for(var i=a;i<=b;i++)o+='<option'+(i===sel?' selected':'')+'>'+i+'</option>';return o}
+function busy(on,btn,txt){if(btn){btn.disabled=on;if(txt)btn.textContent=txt}}
+function top(){window.scrollTo(0,0)}
+/* この端末に予約番号を覚えておく（メールアドレスも一緒に保存。共用端末では「この端末から消す」で削除できます） */
+var MYKEY='yoyaku_my_v1';
+function myGet(){try{var a=JSON.parse(localStorage.getItem(MYKEY)||'[]');return Array.isArray(a)?a:[]}catch(e){return[]}}
+function mySet(a){try{localStorage.setItem(MYKEY,JSON.stringify(a.slice(0,20)))}catch(e){}}
+function myAdd(id,mail){var a=myGet().filter(function(x){return x.id!==id});a.unshift({id:id,mail:mail});mySet(a)}
+function myDel(id){mySet(myGet().filter(function(x){return x.id!==id}))}
+function stBadge(r){
+  var s=r.status;
+  if(s==='confirmed')return '<span class="st ok">予約確定</span>';
+  if(s==='won')return '<span class="st ok">当選・予約確定</span>';
+  if(s==='lottery')return '<span class="st lot">抽選結果待ち</span>';
+  if(s==='wait')return '<span class="st wait">キャンセル待ち '+(r.waitNo||'')+'番目</span>';
+  if(s==='lost')return '<span class="st ng">落選</span>';
+  return '<span class="st ng">キャンセル済み</span>';
+}
+
+/* ---------- イベント一覧 ---------- */
+async function home(){
+  top();
+  app.innerHTML='<p class="note" style="text-align:center;padding:40px 0">読み込み中…</p>';
+  try{
+    var snap=await C.events.where('visible','==',true).get();
+    var evs=snap.docs.map(function(d){return Object.assign({id:d.id},d.data())}).sort(function(a,b){return a.name<b.name?-1:1});
+    var h='<h2>ご予約・お申し込み<small>ご希望のイベントを選んでください</small></h2>';
+    if(!evs.length)h+='<div class="card note">現在、受付中のイベントはありません。</div>';
+    evs.forEach(function(e,i){
+      var closed=e.method==='抽選'&&(e.drawn||(e.deadlineMs&&Date.now()>e.deadlineMs));
+      h+='<button class="ev" data-i="'+i+'"'+(closed?' disabled style="opacity:.55"':'')+'><b>'+esc(e.name)+'</b>'+
+        (e.method==='抽選'?'<span class="tag k">抽選</span><span>'+(closed?'受付は終了しました':'締切 '+dl(e))+'</span>':'<span class="tag">先着順</span>')+'</button>';
+    });
+    var mine=myGet();
+    if(mine.length){
+      h+='<h2 style="margin-top:28px">あなたの予約<small>この端末に保存されています</small></h2><div id="my"><p class="note">読み込み中…</p></div>';
+    }
+    h+='<div style="margin-top:28px;text-align:center"><button class="l" id="lk">ご予約の確認・変更・キャンセル</button></div>';
+    app.innerHTML=h;
+    app.querySelectorAll('.ev').forEach(function(b){b.onclick=function(){S.ev=evs[+b.dataset.i];pickSlot()}});
+    q('lk').onclick=lookupView;
+    if(mine.length)loadMine(mine);
+  }catch(e){app.innerHTML='<div class="card err">読み込めませんでした。電波の良い場所で、もう一度お試しください。</div>'}
+}
+
+async function loadMine(mine){
+  var box=q('my'),out='',rows=[];
+  for(var i=0;i<mine.length;i++){
+    try{var r=await C.lookup(mine[i].id,mine[i].mail);rows.push(r.ok?{id:mine[i].id,rec:r.r}:{id:mine[i].id,gone:true})}
+    catch(e){rows.push({id:mine[i].id,err:true})}
+  }
+  if(!q('my'))return;
+  rows.forEach(function(x,i){
+    if(x.rec){var r=x.rec;
+      out+='<div class="card"><div>'+stBadge(r)+'</div><p style="margin:8px 0 0"><b>'+esc(r.eventName)+'</b><br>'+day(r.date)+' '+rng(r)+'<br>'+esc(r.name)+' 様　'+r.n+'名<br><span class="note">予約番号 '+fmtCode(x.id)+'</span></p>'+
+       '<button class="s" data-o="'+i+'">開く（変更・キャンセル）</button> <button class="s" data-d="'+i+'">この端末から消す</button></div>';
+    }else{
+      out+='<div class="card"><p class="note" style="margin:0">予約番号 '+fmtCode(x.id)+(x.gone?'<br>予約が見つかりませんでした。':'<br>読み込めませんでした。')+'</p><button class="s" data-d="'+i+'">この端末から消す</button></div>';
+    }
+  });
+  box.innerHTML=out;
+  box.querySelectorAll('[data-o]').forEach(function(b){b.onclick=async function(){
+    var x=rows[+b.dataset.o];S.rec=Object.assign({id:x.id},x.rec);S.msg='';b.disabled=true;
+    try{await loadForRec();detailView()}catch(e){b.disabled=false;alert('通信に失敗しました。もう一度お試しください。')}}});
+  box.querySelectorAll('[data-d]').forEach(function(b){b.onclick=function(){
+    if(!confirm('この端末の表示から消します（予約自体はキャンセルされません）。よろしいですか？'))return;
+    myDel(rows[+b.dataset.d].id);home()}});
+}
+
+/* ---------- 日時の選択 ---------- */
+async function pickSlot(){
+  top();
+  app.innerHTML='<p class="note" style="text-align:center;padding:40px 0">読み込み中…</p>';
+  try{
+    var snap=await C.slots.where('eventId','==',S.ev.id).get();
+    S.slots=snap.docs.map(function(d){return Object.assign({id:d.id},d.data())}).sort(function(a,b){return (a.date+a.start)<(b.date+b.start)?-1:1});
+  }catch(e){app.innerHTML='<div class="card err">読み込めませんでした。</div>';return}
+  var ev=S.ev,h='<button class="l" id="bk">← イベント一覧へ</button><h2>'+esc(ev.name)+'<small>'+(ev.method==='抽選'?'抽選のお申し込みです（締切 '+dl(ev)+'）':'先着順のお申し込みです')+'</small></h2>';
+  if(ev.msg)h+='<div class="box">'+esc(ev.msg).replace(/\n/g,'<br>')+'</div>';
+  var cur='';
+  if(!S.slots.length)h+='<div class="card note">現在、選べる日時がありません。</div>';
+  S.slots.forEach(function(s,i){
+    if(s.date!==cur){cur=s.date;h+='<h2 style="font-size:16px">'+day(s.date)+'</h2>'}
+    var full=!ev.method||ev.method==='先着'?((s.booked||0)>=s.capG||(s.capP&&(s.people||0)>=s.capP)):false;
+    var lab=ev.method==='抽選'?'<em>抽選受付中</em>':full?(ev.wait?'<em class="f">満席・キャンセル待ち</em>':'<em class="f">満席</em>'):'<em>残り '+Math.max(0,s.capG-(s.booked||0))+'組</em>';
+    h+='<button class="slot" data-i="'+i+'"'+(full&&!ev.wait?' disabled':'')+'><b>'+rng(s)+'</b>'+lab+'</button>';
+  });
+  app.innerHTML=h;
+  q('bk').onclick=home;
+  app.querySelectorAll('.slot').forEach(function(b){b.onclick=function(){S.slot=S.slots[+b.dataset.i];S.mode='new';S.rec=null;formView()}});
+}
+
+/* ---------- 申込フォーム（新規・変更の共通） ---------- */
+function formView(){
+  top();
+  var ev=S.ev,s=S.slot,r=S.rec||{},edit=S.mode==='edit',car=r.car||{},max=s.maxPer;
+  var stores=r.stores||[];
+  var h=(edit?'<button class="l" id="bk">← 戻る</button>':'<button class="l" id="bk">← 日時を選び直す</button>')+
+   '<h2>'+esc(ev.name)+'<small>'+day(s.date)+' '+rng(s)+'</small></h2>';
+  if(ev.msg)h+='<div class="box">'+esc(ev.msg).replace(/\n/g,'<br>')+'</div>';
+  if(!edit&&ev.method==='抽選')h+='<p class="box">抽選のお申し込みです。'+dl(ev)+'に締め切ります。結果は「ご予約の確認・変更」で、予約番号とメールアドレスを入力してご確認ください。</p>';
+  if(!edit&&ev.method!=='抽選'&&((s.booked||0)>=s.capG||(s.capP&&(s.people||0)>=s.capP)))h+='<p class="box">この枠は満席です。キャンセル待ちとして受け付けます。空きが出た場合は、店舗からご連絡します。</p>';
+  if(edit&&S.slots.length>1){
+    h+='<label>時間帯を変更する<select id="ns">'+S.slots.map(function(x){return '<option value="'+x.id+'"'+(x.id===s.id?' selected':'')+'>'+day(x.date)+' '+rng(x)+'</option>'}).join('')+'</select></label>';
+  }
+  h+='<form id="f" autocomplete="on">'+
+   '<label>代表申込者（個人名）<input id="rn" required maxlength="50" autocomplete="name" value="'+esc(r.name)+'"></label>'+
+   '<label>法人名（法人の場合のみ）<input id="rc" maxlength="50" value="'+esc(r.corp)+'"></label>'+
+   '<label>連絡先（電話番号）<input id="rt" type="tel" required autocomplete="tel" value="'+esc(r.tel)+'"></label>'+
+   '<label>メールアドレス<input id="rm" type="email" required autocomplete="email" value="'+esc(r.mail)+'"'+(edit?' disabled':'')+'></label>'+
+   '<h2 style="font-size:16px">来場人数</h2><div class="g"><label>合計（1〜'+max+'名）<select id="tt"></select></label><label>うち大人<select id="ad"></select></label></div>'+
+   '<div class="note" id="kd"></div><div id="bd" class="g3" hidden></div><div class="note" id="bh"></div>'+
+   (ev.lap?'<p class="box">'+esc(ev.lapText||RV.LAP_TEXT)+'</p>':'')+
+   (ev.names?'<h2 style="font-size:16px">参加者のお名前</h2><div id="pn"></div>':'')+
+   (ev.order?'<label class="chk"><input type="checkbox" id="od"'+(r.order?' checked':'')+'>現在お車注文中でレクサス車未所有の方はチェックをお願い致します。</label>':'')+
+   '<fieldset id="car"><legend>保有レクサス車登録ナンバー</legend><div class="plate">'+
+   '<label>地名<input id="pf" maxlength="6" autocomplete="off" placeholder="鹿児島" value="'+esc(car.pref)+'"></label>'+
+   '<label>分類番号<input id="cl" inputmode="numeric" maxlength="3" autocomplete="off" placeholder="300" value="'+esc(car.cls)+'"></label>'+
+   '<label>ひらがな<input id="kn" maxlength="1" autocomplete="off" placeholder="あ" value="'+esc(car.kana)+'"></label>'+
+   '<label>番号<input id="nm" inputmode="numeric" maxlength="4" autocomplete="off" placeholder="1234" value="'+esc(car.num)+'"></label></div>'+
+   '<label>車種<input id="md" maxlength="30" autocomplete="off" placeholder="例：NX350h" value="'+esc(car.model)+'"></label></fieldset>'+
+   '<fieldset><legend>ご利用店舗（両方可）</legend>'+Object.keys(RV.STORES).map(function(k,i){
+      var on=stores.indexOf(k)>=0;
+      return '<label class="chk"><input type="checkbox" class="st" data-k="'+esc(k)+'"'+(on?' checked':'')+'>'+esc(k)+'</label>'+
+        '<label class="stf" data-k="'+esc(k)+'"'+(on?'':' hidden')+'>担当スタッフ（'+esc(k)+'）<select data-k="'+esc(k)+'"><option value="">選択してください</option>'+RV.STORES[k].map(function(n){return '<option'+(((r.staff||{})[k]===n)?' selected':'')+'>'+esc(n)+'</option>'}).join('')+'</select></label>';
+    }).join('')+'</fieldset>'+
+   (ev.note?'<label>備考（ご要望・ご連絡事項など）<textarea id="nt" rows="3" maxlength="500">'+esc(r.note)+'</textarea></label>':'')+
+   '<div class="err" id="er"></div><button class="p" id="go" type="submit">'+(edit?'変更を保存する':ev.method==='抽選'?'抽選に申し込む':'予約する')+'</button>'+
+   (edit?'<div style="text-align:center;margin-top:18px"><button type="button" class="s d" id="cx">この予約をキャンセルする</button></div>':'')+'</form>';
+  app.innerHTML=h;
+  q('bk').onclick=edit?function(){detailView()}:pickSlot;
+  var tt=q('tt'),ad=q('ad'),bd=q('bd'),kids=0;
+  var T0=edit?Math.min(max,Math.max(1,(+r.a||0)+(+r.k||0)+(+r.s||0)+(+r.m||0))):1;
+  tt.innerHTML=opts(1,max,T0);
+  var A0=edit?(+r.a||1):1;
+  function fillAd(keep){var T=+tt.value;ad.innerHTML=opts(1,T,Math.min(keep,T))}
+  fillAd(A0);
+  function bsum(){return ['bk_','bs_','bm_'].reduce(function(n,i){return n+(q(i)?+q(i).value:0)},0)}
+  function hint(){var h=q('bh');if(!kids){h.textContent='';return}h.textContent='お子様の内訳の合計：'+bsum()+' / '+kids+'名';h.style.color=bsum()===kids?'':'#b42318'}
+  function upd(){
+    var T=+tt.value,A=+ad.value;kids=T-A;
+    q('kd').textContent=kids?'うちお子様 '+kids+'名':'';
+    var pv={bk_:edit?+r.k||0:0,bs_:edit?+r.s||0:0,bm_:edit?+r.m||0:0};
+    if(q('bk_')){pv={bk_:+q('bk_').value,bs_:+q('bs_').value,bm_:+q('bm_').value}}
+    bd.hidden=!kids;
+    bd.innerHTML=kids?[['bk_','未就学児'],['bs_','小学生'],['bm_','中学生以上']].map(function(x){return '<label>'+x[1]+'<select id="'+x[0]+'">'+opts(0,kids,Math.min(kids,pv[x[0]]))+'</select></label>'}).join(''):'';
+    if(kids)['bk_','bs_','bm_'].forEach(function(i){q(i).onchange=hint});
+    hint();
+    if(q('pn')){
+      var cur=[].map.call(q('pn').querySelectorAll('input'),function(i){return i.value});
+      if(!cur.length&&edit)cur=(r.participants||[]).slice();
+      var h='';for(var i=0;i<T;i++)h+='<label style="margin:6px 0">参加者'+(i+1)+'<input maxlength="40" value="'+esc(cur[i]!==undefined?cur[i]:(i===0?q('rn').value:''))+'"></label>';
+      q('pn').innerHTML=h;
+    }
+  }
+  tt.onchange=function(){fillAd(+ad.value);upd()};ad.onchange=upd;
+  upd();
+  if(edit&&kids){q('bk_').value=Math.min(kids,+r.k||0);q('bs_').value=Math.min(kids,+r.s||0);q('bm_').value=Math.min(kids,+r.m||0);hint()}
+  if(q('od')){var od=q('od');var tg=function(){q('car').disabled=od.checked};od.onchange=tg;tg()}
+  /* ナンバー入力の補助 */
+  var half=function(s){return s.replace(/[０-９]/g,function(c){return String.fromCharCode(c.charCodeAt(0)-65248)})};
+  q('cl').oninput=function(){this.value=half(this.value).replace(/\D/g,'').slice(0,3);if(this.value.length===3)q('kn').focus()};
+  q('nm').oninput=function(){this.value=half(this.value).replace(/\D/g,'').slice(0,4)};
+  q('kn').oninput=function(){this.value=this.value.replace(/[ァ-ヶ]/g,function(c){return String.fromCharCode(c.charCodeAt(0)-96)}).replace(/[^ぁ-ん]/g,'').slice(0,1);if(this.value)q('nm').focus()};
+  q('md').oninput=function(){this.value=this.value.replace(/[ａ-ｚＡ-Ｚ０-９]/g,function(c){return String.fromCharCode(c.charCodeAt(0)-65248)}).toUpperCase()};
+  app.querySelectorAll('.st').forEach(function(c){c.onchange=function(){app.querySelector('.stf[data-k="'+c.dataset.k+'"]').hidden=!c.checked}});
+  q('rm').oninput=null;
+  q('f').onsubmit=function(e){e.preventDefault();submit()};
+  if(edit)q('cx').onclick=cancelView;
+}
+function gather(){
+  var ev=S.ev,s=S.slot,edit=S.mode==='edit',er=[];
+  var get=function(id){return q(id)?q(id).value.trim():''};
+  var T=+q('tt').value,A=+q('ad').value,kids=T-A;
+  var kk=q('bk_')?+q('bk_').value:0,ks=q('bs_')?+q('bs_').value:0,km=q('bm_')?+q('bm_').value:0;
+  if(kids&&kk+ks+km!==kids)er.push('お子様の内訳の合計を、お子様の人数（'+kids+'名）に合わせてください');
+  var d={name:get('rn'),corp:get('rc'),tel:get('rt'),mail:edit?S.rec.mail:get('rm'),a:A,k:kk,s:ks,m:km,note:get('nt'),participants:[],car:{},order:!!(q('od')&&q('od').checked),stores:[],staff:{}};
+  if(!d.name)er.push('代表申込者を入力してください');
+  if(!/^[0-9０-９+\-ー－\s]{9,15}$/.test(d.tel))er.push('連絡先（電話番号）を正しく入力してください');
+  if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(d.mail))er.push('メールアドレスを正しく入力してください');
+  if(q('pn'))d.participants=[].map.call(q('pn').querySelectorAll('input'),function(i){return i.value.trim()});
+  if(!d.order){
+    d.car={pref:get('pf'),cls:get('cl'),kana:get('kn'),num:get('nm'),model:get('md')};
+    if(!d.car.pref||!/^\d{1,3}$/.test(d.car.cls)||!/^[ぁ-ん]$/.test(d.car.kana)||!/^\d{1,4}$/.test(d.car.num))er.push('保有レクサス車の登録ナンバーを入力してください');
+    if(!d.car.model)er.push('車種を入力してください');
+  }
+  app.querySelectorAll('.st').forEach(function(c){
+    if(!c.checked)return;
+    var k=c.dataset.k,v=app.querySelector('select[data-k="'+k+'"]').value;
+    d.stores.push(k);if(!v)er.push(k+'の担当スタッフを選択してください');else d.staff[k]=v;
+  });
+  if(!d.stores.length)er.push('ご利用店舗を選択してください');
+  return {d:d,er:er};
+}
+async function submit(){
+  var g=gather(),er=q('er'),btn=q('go');
+  if(g.er.length){er.textContent=g.er.join('\n');return}
+  er.textContent='';busy(true,btn,'送信中…');
+  try{
+    var r;
+    if(S.mode==='edit'){
+      var ns=q('ns')?q('ns').value:S.slot.id;
+      var patch=Object.assign({},g.d);delete patch.mail;
+      r=await C.change(S.rec.id,S.rec.mail,patch,ns);
+      if(r.ok){var l=await C.lookup(S.rec.id,S.rec.mail);S.rec=Object.assign({id:S.rec.id},l.r);S.msg='変更を保存しました';return detailView()}
+    }else{
+      r=await C.book(S.slot.id,g.d);
+      if(r.ok){myAdd(r.id,g.d.mail);return doneView(r,g.d)}
+    }
+    er.textContent=r.msg||'処理できませんでした';
+  }catch(e){er.textContent='通信に失敗しました。電波の良い場所で、もう一度お試しください。（'+(e.code||e.message||'')+'）'}
+  busy(false,btn,S.mode==='edit'?'変更を保存する':S.ev.method==='抽選'?'抽選に申し込む':'予約する');
+}
+
+/* ---------- 完了 ---------- */
+function doneView(r,d){
+  top();
+  var s=S.slot,ev=S.ev;
+  var msg=r.status==='confirmed'?'ご予約が完了しました。':r.status==='wait'?'キャンセル待ちとして受け付けました（'+r.waitNo+'番目）。空きが出た場合は、店舗からご連絡します。':'抽選のお申し込みを受け付けました。';
+  app.innerHTML='<h2>'+msg+'</h2><div class="card"><b>'+esc(ev.name)+'</b><br>'+day(s.date)+' '+rng(s)+'<br>'+esc(d.name)+' 様　'+(d.a+d.k+d.s+d.m)+'名</div>'+
+   '<p class="note" style="margin:14px 0 0">予約番号（変更・キャンセル'+(ev.method==='抽選'?'・抽選結果の確認':'')+'に必要です）</p><div class="code">'+fmtCode(r.id)+'</div>'+
+   '<div class="box">この予約番号は、この端末のトップ画面「あなたの予約」にも表示されます。別の端末で確認する場合に備えて、スクリーンショットを保存するか、予約番号をメモしてください。予約確認のメールは送信されません。</div>'+
+   '<button class="p" id="hm" style="margin-top:14px">トップへ戻る</button>';
+  q('hm').onclick=home;
+}
+
+/* ---------- 予約の確認・変更・キャンセル ---------- */
+function lookupView(){
+  top();
+  app.innerHTML='<button class="l" id="bk">← 戻る</button><h2>ご予約の確認・変更・キャンセル</h2><form id="f"><label>予約番号<input id="lc" autocomplete="off" autocapitalize="characters" placeholder="XXXX-XXXX-XXXX" required></label>'+
+   '<label>メールアドレス（お申し込み時のもの）<input id="lm" type="email" autocomplete="email" required></label><div class="err" id="er"></div><button class="p" id="go" type="submit">確認する</button></form>';
+  q('bk').onclick=home;
+  q('f').onsubmit=async function(e){
+    e.preventDefault();busy(true,q('go'),'確認中…');
+    try{
+      var r=await C.lookup(q('lc').value,q('lm').value);
+      if(!r.ok){q('er').textContent=r.msg;busy(false,q('go'),'確認する');return}
+      S.rec=Object.assign({id:r.id},r.r);myAdd(r.id,S.rec.mail);S.msg='';await loadForRec();detailView();
+    }catch(x){q('er').textContent='通信に失敗しました。もう一度お試しください。（'+(x.code||x.message||'')+'）';busy(false,q('go'),'確認する')}
+  };
+}
+async function loadForRec(){
+  var r=S.rec,es=await C.events.doc(r.eventId).get();
+  S.ev=Object.assign({id:r.eventId},es.exists?es.data():{name:r.eventName});
+  var sn=await C.slots.where('eventId','==',r.eventId).get();
+  S.slots=sn.docs.map(function(d){return Object.assign({id:d.id},d.data())}).sort(function(a,b){return (a.date+a.start)<(b.date+b.start)?-1:1});
+  S.slot=S.slots.filter(function(x){return x.id===r.slotId})[0]||{id:r.slotId,date:r.date,start:r.start,end:r.end,maxPer:4,capG:0};
+}
+function detailView(){
+  top();
+  var r=S.rec,can=r.status!=='cancel'&&r.status!=='lost';
+  var h='<button class="l" id="bk">← トップへ</button><h2>ご予約内容</h2>'+(S.msg?'<div class="box">'+esc(S.msg)+'</div>':'')+
+   '<div class="card"><div>'+stBadge(r)+'</div><p style="margin:8px 0 0"><b>'+esc(r.eventName)+'</b><br>'+day(r.date)+' '+rng(r)+'<br>'+esc(r.name)+' 様　'+r.n+'名<br><span class="note">予約番号 '+fmtCode(r.id)+'</span></p></div>';
+  if(r.status==='wait')h+='<div class="box">キャンセル待ちです。空きが出た場合は、店舗からご連絡します。</div>';
+  if(r.status==='lottery')h+='<div class="box">抽選結果は、締切後にこの画面で確認できます。</div>';
+  if(r.status==='lost')h+='<div class="box">今回は抽選の結果、ご案内できませんでした。</div>';
+  if(can)h+='<button class="p" id="ed">内容を変更する</button><div style="text-align:center;margin-top:16px"><button class="s d" id="cx">この予約をキャンセルする</button></div>';
+  app.innerHTML=h;
+  q('bk').onclick=home;
+  if(can){q('ed').onclick=function(){S.mode='edit';formView()};q('cx').onclick=cancelView}
+}
+function cancelView(){
+  var r=S.rec;
+  if(!confirm('この予約をキャンセルします。よろしいですか？'))return;
+  C.cancel(r.id,r.mail).then(function(x){
+    if(!x.ok){alert(x.msg);return}
+    S.rec.status='cancel';S.msg='キャンセルしました';detailView();
+  }).catch(function(){alert('通信に失敗しました。もう一度お試しください。')});
+}
+
+/* ---------- 起動 ---------- */
+var RV=window.RV;
+if(typeof firebase==='undefined'||!window.FIREBASE_CONFIG||/ここに/.test(FIREBASE_CONFIG.apiKey)){
+  app.innerHTML='<div class="card err">Firebaseの設定が未入力です（firebase-config.js）。</div>';
+}else{
+  firebase.initializeApp(FIREBASE_CONFIG);
+  C=makeCore(firebase,firebase.firestore());
+  home();
+}
+})();
+</script>
+</body>
+</html>
